@@ -99,7 +99,7 @@ button:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
   <div class="seg" id="diff" role="group" aria-label="칸 크기"></div>
   <div class="grid" id="cards"></div>
   <ul class="how">
-    <li><b>터치</b> 선택한 번호의 칸을 눌러 칠해요. 줄무늬로 표시된 칸이 지금 칠할 칸이에요.</li>
+    <li><b>터치</b> 선택한 번호의 칸을 눌러 칠해요. 줄무늬로 표시된 칸이 지금 칠할 칸이고, 서로 붙어 있는 같은 번호는 한 번만 눌러도 한꺼번에 칠해져요.</li>
     <li><b>확대·이동</b> 두 손가락으로 벌리거나 마우스 휠로 확대하고, 끌어서 움직여요.</li>
     <li><b>붓 모드</b> 붓 버튼을 켜면 손가락으로 쓱 문지르기만 해도 칸이 채워져요.</li>
   </ul>
@@ -449,7 +449,13 @@ function build(scene, diff){
       if(x<bx0[r])bx0[r]=x; if(x>bx1[r])bx1[r]=x; if(y<by0[r])by0[r]=y; if(y>by1[r])by1[r]=y; }
     lx[r]=bp%N+.5; ly[r]=((bp/N)|0)+.5; rad[r]=bd/3;
     const digits=String(col[r]+1).length; fs[r]=Math.min(rad[r]*1.35, rad[r]*1.85/(.6*digits), 46); }
-  return {N,lab,R,col,pal,start,pix,lx,ly,rad,fs,bx0,by0,bx1,by1};
+  // 7. which regions touch which — lets one tap fill a whole same-number patch at once
+  const adjSet=Array.from({length:R},()=>new Set());
+  for(let p=0;p<P;p++){ const l=lab[p], x=p%N;
+    if(x<N-1){ const t=lab[p+1]; if(t!==l){ adjSet[l].add(t); adjSet[t].add(l); } }
+    if(p<P-N){ const t=lab[p+N]; if(t!==l){ adjSet[l].add(t); adjSet[t].add(l); } } }
+  const adj=adjSet.map(s=>Int32Array.from(s));
+  return {N,lab,R,col,pal,start,pix,lx,ly,rad,fs,bx0,by0,bx1,by1,adj};
 }
 function lists(lab,n,P){
   const start=new Int32Array(n+1); for(let p=0;p<P;p++) start[lab[p]+1]++;
@@ -579,8 +585,14 @@ function save(){ clearTimeout(saveTimer); saveTimer=setTimeout(()=>{ if(!S) retu
   store.set(saveKey(curScene,curDiff),{n:S.R,c:filledN,f:btoa(bin)}); },300); }
 
 function fill(r){
-  F[r]=1; filledN++; const k=S.col[r]; remain[k]--;
-  paintRegion(r); ripples.push({x:S.lx[r],y:S.ly[r],t:performance.now(),c:S.pal[k]});
+  // fills the whole connected patch of this number in one go, not just the tapped cell
+  const k=S.col[r], group=[r], stack=[r]; F[r]=1;
+  while(stack.length){ const cur=stack.pop();
+    for(const n of S.adj[cur]) if(!F[n]&&S.col[n]===k){ F[n]=1; group.push(n); stack.push(n); } }
+  filledN+=group.length; remain[k]-=group.length;
+  for(const rr of group) paintRegion(rr);
+  const step=Math.max(1,Math.ceil(group.length/24)), now0=performance.now();
+  for(let i=0;i<group.length;i+=step) ripples.push({x:S.lx[group[i]],y:S.ly[group[i]],t:now0,c:S.pal[k]});
   refreshPalette(k); updateStat(); save();
   if(filledN===S.R){ setTimeout(()=>showDone(true),500); return; }
   if(remain[k]===0){ const nx=firstOpen(k+1); toast(`${k+1}번 완료! 이제 ${nx+1}번 색이에요`); select(nx); }
