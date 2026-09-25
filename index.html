@@ -455,7 +455,30 @@ function build(scene, diff){
     if(x<N-1){ const t=lab[p+1]; if(t!==l){ adjSet[l].add(t); adjSet[t].add(l); } }
     if(p<P-N){ const t=lab[p+N]; if(t!==l){ adjSet[l].add(t); adjSet[t].add(l); } } }
   const adj=adjSet.map(s=>Int32Array.from(s));
-  return {N,lab,R,col,pal,start,pix,lx,ly,rad,fs,bx0,by0,bx1,by1,adj};
+  // 8. trace each region's exact outline on the pixel grid and turn it into a vector path,
+  //    so cells render as crisp shapes at any zoom instead of a scaled-up bitmap
+  const W1=N+1, paths=new Array(R);
+  for(let r=0;r<R;r++){
+    const nextC=new Map();
+    for(let i=start[r];i<start[r+1];i++){ const p=pix[i], x=p%N, y=(p/N)|0;
+      if(y===0||lab[p-N]!==r) nextC.set(y*W1+x, y*W1+x+1);           // top edge
+      if(x===N-1||lab[p+1]!==r) nextC.set(y*W1+x+1, (y+1)*W1+x+1);   // right edge
+      if(y===N-1||lab[p+N]!==r) nextC.set((y+1)*W1+x+1, (y+1)*W1+x); // bottom edge
+      if(x===0||lab[p-1]!==r) nextC.set((y+1)*W1+x, y*W1+x); }       // left edge
+    const visited=new Set(), loops=[];
+    for(const c0 of nextC.keys()){ if(visited.has(c0)) continue;
+      const raw=[]; let c=c0, guard=0;
+      do{ visited.add(c); raw.push(c%W1,(c/W1)|0); c=nextC.get(c); } while(c!==c0&&++guard<100000);
+      const n=raw.length/2, pts=[];
+      for(let i=0;i<n;i++){ const pi=((i-1+n)%n)*2, ni=((i+1)%n)*2, cx=raw[i*2],cy=raw[i*2+1];
+        const d1x=cx-raw[pi],d1y=cy-raw[pi+1], d2x=raw[ni]-cx,d2y=raw[ni+1]-cy;
+        if(d1x*d2y-d1y*d2x!==0||d1x*d2x+d1y*d2y<=0) pts.push(cx,cy); }
+      loops.push(pts.length>=6?pts:raw); }
+    const path=new Path2D();
+    for(const loop of loops){ path.moveTo(loop[0],loop[1]); for(let i=2;i<loop.length;i+=2) path.lineTo(loop[i],loop[i+1]); path.closePath(); }
+    paths[r]=path;
+  }
+  return {N,lab,R,col,pal,start,pix,lx,ly,rad,fs,bx0,by0,bx1,by1,adj,paths};
 }
 function lists(lab,n,P){
   const start=new Int32Array(n+1); for(let p=0;p<P;p++) start[lab[p]+1]++;
@@ -494,11 +517,18 @@ const view=$('#view'), vctx=view.getContext('2d'), stageEl=$('#stage');
 const built=new Map();
 let S=null;           // current puzzle
 let F, remain, colRegs, sel=0, filledN=0;
-let base, bctx, img, buf, PAL32, FAINT, HL1, HL2, BORDER;
+let FAINT, stripePattern=null;
+const BORDER='#a3a8b8';
 let s=1, tx=0, ty=0, dpr=1, vw=1, vh=1, fitted=false;
-let brush=false, ripples=[], hintR=-1, hintT=0, dirty=null, needDraw=false, curScene=null, curDiff=null, resetArm=0;
+let brush=false, ripples=[], hintR=-1, hintT=0, needDraw=false, curScene=null, curDiff=null, resetArm=0;
 
-function rgba32(h){ const [r,g,b]=hexRgb(h); return (0xff000000|(b<<16)|(g<<8)|r)>>>0; }
+function buildStripe(){
+  const pc=document.createElement('canvas'); pc.width=pc.height=16; const pg=pc.getContext('2d');
+  pg.fillStyle='#c3cadb'; pg.fillRect(0,0,16,16);
+  pg.strokeStyle='#a6b0c8'; pg.lineWidth=8;
+  pg.beginPath(); for(let o=-16;o<32;o+=16){ pg.moveTo(o,16); pg.lineTo(o+16,0); } pg.stroke();
+  return pg.createPattern(pc,'repeat');
+}
 function openScene(scene){
   curScene=scene; curDiff=DIFFS[diffIdx];
   $('#gallery').hidden=true; $('#play').hidden=false; $('#done').hidden=true;
@@ -511,41 +541,18 @@ function openScene(scene){
   }, 40);
 }
 function start(P){
-  S=P; const {N,R,col,pal}=S;
+  S=P; const {R,col,pal}=S;
+  if(!stripePattern) stripePattern=buildStripe();
   F=new Uint8Array(R); remain=new Int32Array(pal.length); colRegs=pal.map(()=>[]);
   for(let r=0;r<R;r++){ remain[col[r]]++; colRegs[col[r]].push(r); }
   const sv=store.get(saveKey(curScene,curDiff)); filledN=0;
   if(sv&&sv.n===R&&sv.f){ const bin=atob(sv.f); for(let r=0;r<R;r++) if(bin.charCodeAt(r>>3)&(1<<(r&7))){ F[r]=1; remain[col[r]]--; filledN++; } }
-  PAL32=Uint32Array.from(pal.map(rgba32));
-  FAINT=Uint32Array.from(pal.map(h=>{ const [r,g,b]=hexRgb(h), l=.3*r+.59*g+.11*b, v=Math.round(246-(255-l)*.07); return rgba32('#'+[v,v,Math.min(255,v+4)].map(x=>x.toString(16).padStart(2,'0')).join('')); }));
-  HL1=rgba32('#a6b0c8'); HL2=rgba32('#c3cadb'); BORDER=rgba32('#a3a8b8');
-  base=document.createElement('canvas'); base.width=base.height=N; bctx=base.getContext('2d');
-  img=bctx.createImageData(N,N); buf=new Uint32Array(img.data.buffer);
+  FAINT=pal.map(h=>{ const [r,g,b]=hexRgb(h), l=.3*r+.59*g+.11*b, v=Math.round(246-(255-l)*.07); return '#'+[v,v,Math.min(255,v+4)].map(x=>x.toString(16).padStart(2,'0')).join(''); });
   sel=firstOpen(0); if(sel<0) sel=0;
-  for(let p=0;p<N*N;p++) buf[p]=pixColor(p);
-  bctx.putImageData(img,0,0);
   buildPalette(); updateStat();
   $('#loading').hidden=true; fitted=false; resize();
   if(filledN===R) showDone(false);
 }
-function pixColor(p){
-  const lab=S.lab, r=lab[p], fr=F[r], N=S.N;
-  if(p%N<N-1){ const t=lab[p+1]; if(t!==r&&!(fr&&F[t])) return BORDER; }
-  if(p<N*N-N){ const t=lab[p+N]; if(t!==r&&!(fr&&F[t])) return BORDER; }
-  if(fr) return PAL32[S.col[r]];
-  if(S.col[r]===sel){ const x=p%N, y=(p/N)|0; return ((x+y)&7)<4?HL1:HL2; }
-  return FAINT[S.col[r]];
-}
-function paintRegion(r){
-  const {start,pix,lab,N}=S;
-  for(let i=start[r];i<start[r+1];i++){ const p=pix[i]; buf[p]=pixColor(p);
-    if(p%N>0&&lab[p-1]!==r) buf[p-1]=pixColor(p-1);
-    if(p>=N&&lab[p-N]!==r) buf[p-N]=pixColor(p-N); }
-  const x0=Math.max(0,S.bx0[r]-1), y0=Math.max(0,S.by0[r]-1), x1=S.bx1[r]+1, y1=S.by1[r]+1;
-  dirty=dirty?[Math.min(dirty[0],x0),Math.min(dirty[1],y0),Math.max(dirty[2],x1),Math.max(dirty[3],y1)]:[x0,y0,x1,y1];
-  req();
-}
-function flush(){ if(!dirty) return; const [x0,y0,x1,y1]=dirty; bctx.putImageData(img,0,0,x0,y0,x1-x0+1,y1-y0+1); dirty=null; }
 function firstOpen(from){ const n=S.pal.length; for(let i=0;i<n;i++){ const k=(from+i)%n; if(remain[k]>0) return k; } return -1; }
 
 function buildPalette(){
@@ -568,9 +575,7 @@ function refreshPalette(k){
   for(const bt of btns) bt.setAttribute('aria-pressed', +bt.dataset.k===sel);
 }
 function select(k){
-  if(k===sel) return; const old=sel; sel=k;
-  for(const r of colRegs[old]) paintRegion(r);
-  for(const r of colRegs[k]) paintRegion(r);
+  if(k===sel) return; sel=k; req();
   refreshPalette(); const bt=$('#pal').children[k]; bt.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'});
 }
 function updateStat(){
@@ -589,8 +594,7 @@ function fill(r){
   const k=S.col[r], group=[r], stack=[r]; F[r]=1;
   while(stack.length){ const cur=stack.pop();
     for(const n of S.adj[cur]) if(!F[n]&&S.col[n]===k){ F[n]=1; group.push(n); stack.push(n); } }
-  filledN+=group.length; remain[k]-=group.length;
-  for(const rr of group) paintRegion(rr);
+  filledN+=group.length; remain[k]-=group.length; req();
   const step=Math.max(1,Math.ceil(group.length/24)), now0=performance.now();
   for(let i=0;i<group.length;i+=step) ripples.push({x:S.lx[group[i]],y:S.ly[group[i]],t:now0,c:S.pal[k]});
   refreshPalette(k); updateStat(); save();
@@ -614,13 +618,22 @@ function draw(){
   needDraw=false; const c=vctx;
   c.setTransform(1,0,0,1,0,0); c.clearRect(0,0,view.width,view.height);
   if(!S) return;
-  flush(); clampView();
+  clampView();
   c.setTransform(dpr*s,0,0,dpr*s,dpr*tx,dpr*ty);
-  c.imageSmoothingEnabled=s*dpr<3; c.imageSmoothingQuality='high';
-  c.fillStyle='rgba(30,20,70,.12)'; c.fillRect(-2/s,-2/s,S.N+4/s,S.N+4/s); c.drawImage(base,0,0);
+  c.fillStyle='rgba(30,20,70,.12)'; c.fillRect(-2/s,-2/s,S.N+4/s,S.N+4/s);
+  // vector fills stay crisp at any zoom — no bitmap to blur or pixelate
+  c.lineJoin='round'; const lw=Math.max(1,1.2*dpr)/(dpr*s);
+  const vx0=-tx/s, vy0=-ty/s, vx1=(vw-tx)/s, vy1=(vh-ty)/s;
+  const {R,col,pal,paths,bx0,by0,bx1,by1,lx,ly,fs}=S;
+  for(let r=0;r<R;r++){
+    if(bx1[r]<vx0||by1[r]<vy0||bx0[r]>vx1||by0[r]>vy1) continue;
+    const k=col[r], p=paths[r];
+    c.fillStyle = F[r] ? pal[k] : (k===sel ? stripePattern : FAINT[k]);
+    c.fill(p);
+    if(!F[r]){ c.strokeStyle=BORDER; c.lineWidth=lw; c.stroke(p); }
+  }
   c.setTransform(dpr,0,0,dpr,0,0);
   c.textAlign='center'; c.textBaseline='middle';
-  const {R,col,lx,ly,fs}=S;
   for(let r=0;r<R;r++){ if(F[r]) continue; const f=fs[r]*s; if(f<7) continue;
     const x=lx[r]*s+tx, y=ly[r]*s+ty; if(x<-20||y<-20||x>vw+20||y>vh+20) continue;
     const on=col[r]===sel; c.font=`${on?700:400} ${Math.min(f,60).toFixed(1)}px ${on?'"Jua",':''}system-ui,sans-serif`;
@@ -695,7 +708,9 @@ $('#doneView').onclick=()=>{ $('#done').hidden=true; stopConfetti(); $('#fit').o
 /* ================= finish ================= */
 let confT=0;
 function showDone(celebrate){
-  $('#doneImg').src=base.toDataURL('image/png'); $('#done').hidden=false;
+  const cv=document.createElement('canvas'); cv.width=cv.height=1200;
+  const g=cv.getContext('2d'); g.scale(1.2,1.2); curScene.draw(kit(g,curScene.pal));
+  $('#doneImg').src=cv.toDataURL('image/png'); $('#done').hidden=false;
   if(celebrate&&!matchMedia('(prefers-reduced-motion: reduce)').matches) confetti();
 }
 function confetti(){
