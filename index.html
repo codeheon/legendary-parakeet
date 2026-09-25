@@ -455,9 +455,42 @@ function build(scene, diff){
     if(x<N-1){ const t=lab[p+1]; if(t!==l){ adjSet[l].add(t); adjSet[t].add(l); } }
     if(p<P-N){ const t=lab[p+N]; if(t!==l){ adjSet[l].add(t); adjSet[t].add(l); } } }
   const adj=adjSet.map(s=>Int32Array.from(s));
-  // 8. trace each region's exact outline on the pixel grid and turn it into a vector path,
-  //    so cells render as crisp shapes at any zoom instead of a scaled-up bitmap
-  const W1=N+1, paths=new Array(R);
+  // 8. trace each region's exact outline on the pixel grid, then fit a smooth spline through it —
+  //    so cells render as real curved vector shapes (not a pixel staircase) at any zoom.
+  //    Grid corners where 3+ regions meet are kept exactly fixed so neighbouring cells still
+  //    share the same seam and never leave a gap; the smoothing only bends the runs in between.
+  const W1=N+1;
+  const isJ=new Uint8Array(W1*W1);
+  for(let cy=0;cy<=N;cy++) for(let cx=0;cx<=N;cx++){
+    const a=(cx>0&&cy>0)?lab[(cy-1)*N+cx-1]:-1, b=(cx<N&&cy>0)?lab[(cy-1)*N+cx]:-1,
+          c=(cx>0&&cy<N)?lab[cy*N+cx-1]:-1, d=(cx<N&&cy<N)?lab[cy*N+cx]:-1;
+    let cnt=1; if(b!==a)cnt++; if(c!==a&&c!==b)cnt++; if(d!==a&&d!==b&&d!==c)cnt++;
+    if(cnt>=3) isJ[cy*W1+cx]=1;
+  }
+  const collinear=raw=>{ const n=raw.length/2, pts=[];
+    for(let i=0;i<n;i++){ const pi=((i-1+n)%n)*2, ni=((i+1)%n)*2, cx=raw[i*2],cy=raw[i*2+1];
+      const d1x=cx-raw[pi],d1y=cy-raw[pi+1], d2x=raw[ni]-cx,d2y=raw[ni+1]-cy;
+      if(d1x*d2y-d1y*d2x!==0||d1x*d2x+d1y*d2y<=0) pts.push(cx,cy); }
+    return pts.length>=6?pts:raw; };
+  const EPS2=1.9*1.9;
+  const dp=pts=>{ const n=pts.length/2; if(n<=2) return pts.slice();
+    const keep=new Uint8Array(n); keep[0]=1; keep[n-1]=1; const stack=[[0,n-1]];
+    while(stack.length){ const [i0,i1]=stack.pop(); if(i1<=i0+1) continue;
+      const x0=pts[i0*2],y0=pts[i0*2+1], x1=pts[i1*2],y1=pts[i1*2+1], dx=x1-x0,dy=y1-y0, len2=dx*dx+dy*dy||1e-9;
+      let maxD=-1,maxI=-1;
+      for(let i=i0+1;i<i1;i++){ const px=pts[i*2],py=pts[i*2+1];
+        const t=Math.max(0,Math.min(1,((px-x0)*dx+(py-y0)*dy)/len2)), cx=x0+dx*t,cy=y0+dy*t, d=(px-cx)**2+(py-cy)**2;
+        if(d>maxD){maxD=d;maxI=i;} }
+      if(maxD>EPS2){ keep[maxI]=1; stack.push([i0,maxI],[maxI,i1]); } }
+    const out=[]; for(let i=0;i<n;i++) if(keep[i]) out.push(pts[i*2],pts[i*2+1]); return out; };
+  const chain=(raw,i0,i1)=>{ const n=raw.length/2; let steps=(i1-i0+n)%n; if(steps===0) steps=n;
+    const pts=[]; for(let k=0;k<=steps;k++){ const i=(i0+k)%n; pts.push(raw[i*2],raw[i*2+1]); } return pts; };
+  const spline=(path,pts)=>{ const n=pts.length/2; if(n<2) return;
+    if(n===2){ path.lineTo(pts[2],pts[3]); return; }
+    for(let i=0;i<n-1;i++){ const i0=Math.max(0,i-1),i2=i+1,i3=Math.min(n-1,i+2);
+      const p0x=pts[i0*2],p0y=pts[i0*2+1], p1x=pts[i*2],p1y=pts[i*2+1], p2x=pts[i2*2],p2y=pts[i2*2+1], p3x=pts[i3*2],p3y=pts[i3*2+1];
+      path.bezierCurveTo(p1x+(p2x-p0x)/6,p1y+(p2y-p0y)/6, p2x-(p3x-p1x)/6,p2y-(p3y-p1y)/6, p2x,p2y); } };
+  const paths=new Array(R);
   for(let r=0;r<R;r++){
     const nextC=new Map();
     for(let i=start[r];i<start[r+1];i++){ const p=pix[i], x=p%N, y=(p/N)|0;
@@ -465,17 +498,19 @@ function build(scene, diff){
       if(x===N-1||lab[p+1]!==r) nextC.set(y*W1+x+1, (y+1)*W1+x+1);   // right edge
       if(y===N-1||lab[p+N]!==r) nextC.set((y+1)*W1+x+1, (y+1)*W1+x); // bottom edge
       if(x===0||lab[p-1]!==r) nextC.set((y+1)*W1+x, y*W1+x); }       // left edge
-    const visited=new Set(), loops=[];
+    const visited=new Set(), path=new Path2D();
     for(const c0 of nextC.keys()){ if(visited.has(c0)) continue;
       const raw=[]; let c=c0, guard=0;
       do{ visited.add(c); raw.push(c%W1,(c/W1)|0); c=nextC.get(c); } while(c!==c0&&++guard<100000);
-      const n=raw.length/2, pts=[];
-      for(let i=0;i<n;i++){ const pi=((i-1+n)%n)*2, ni=((i+1)%n)*2, cx=raw[i*2],cy=raw[i*2+1];
-        const d1x=cx-raw[pi],d1y=cy-raw[pi+1], d2x=raw[ni]-cx,d2y=raw[ni+1]-cy;
-        if(d1x*d2y-d1y*d2x!==0||d1x*d2x+d1y*d2y<=0) pts.push(cx,cy); }
-      loops.push(pts.length>=6?pts:raw); }
-    const path=new Path2D();
-    for(const loop of loops){ path.moveTo(loop[0],loop[1]); for(let i=2;i<loop.length;i+=2) path.lineTo(loop[i],loop[i+1]); path.closePath(); }
+      const jIdx=[]; for(let i=0;i<raw.length/2;i++) if(isJ[raw[i*2+1]*W1+raw[i*2]]) jIdx.push(i);
+      if(jIdx.length===0){ const poly=collinear(raw);
+        path.moveTo(poly[0],poly[1]); for(let i=2;i<poly.length;i+=2) path.lineTo(poly[i],poly[i+1]); path.closePath(); continue; }
+      const m=jIdx.length; let first=true;
+      for(let k=0;k<m;k++){ const seg=dp(chain(raw,jIdx[k],jIdx[(k+1)%m]));
+        if(first){ path.moveTo(seg[0],seg[1]); first=false; }
+        spline(path,seg); }
+      path.closePath();
+    }
     paths[r]=path;
   }
   return {N,lab,R,col,pal,start,pix,lx,ly,rad,fs,bx0,by0,bx1,by1,adj,paths};
@@ -520,7 +555,7 @@ let F, remain, colRegs, sel=0, filledN=0;
 let FAINT, stripePattern=null;
 const BORDER='#a3a8b8';
 let s=1, tx=0, ty=0, dpr=1, vw=1, vh=1, fitted=false;
-let brush=false, ripples=[], hintR=-1, hintT=0, needDraw=false, curScene=null, curDiff=null, resetArm=0;
+let brush=false, ripples=[], hintR=-1, hintT=0, needDraw=false, curScene=null, curDiff=null, resetArm=0, doneTimer=0;
 
 function buildStripe(){
   const pc=document.createElement('canvas'); pc.width=pc.height=16; const pg=pc.getContext('2d');
@@ -530,7 +565,7 @@ function buildStripe(){
   return pg.createPattern(pc,'repeat');
 }
 function openScene(scene){
-  curScene=scene; curDiff=DIFFS[diffIdx];
+  curScene=scene; curDiff=DIFFS[diffIdx]; clearTimeout(doneTimer);
   $('#gallery').hidden=true; $('#play').hidden=false; $('#done').hidden=true;
   $('#ptitle').textContent=scene.name; $('#pstat').textContent=''; $('#pal').innerHTML='';
   $('#loading').hidden=false; S=null; resize();
@@ -598,7 +633,7 @@ function fill(r){
   const step=Math.max(1,Math.ceil(group.length/24)), now0=performance.now();
   for(let i=0;i<group.length;i+=step) ripples.push({x:S.lx[group[i]],y:S.ly[group[i]],t:now0,c:S.pal[k]});
   refreshPalette(k); updateStat(); save();
-  if(filledN===S.R){ setTimeout(()=>showDone(true),500); return; }
+  if(filledN===S.R){ doneTimer=setTimeout(()=>showDone(true),500); return; }
   if(remain[k]===0){ const nx=firstOpen(k+1); toast(`${k+1}번 완료! 이제 ${nx+1}번 색이에요`); select(nx); }
 }
 
@@ -627,10 +662,12 @@ function draw(){
   const {R,col,pal,paths,bx0,by0,bx1,by1,lx,ly,fs}=S;
   for(let r=0;r<R;r++){
     if(bx1[r]<vx0||by1[r]<vy0||bx0[r]>vx1||by0[r]>vy1) continue;
-    const k=col[r], p=paths[r];
-    c.fillStyle = F[r] ? pal[k] : (k===sel ? stripePattern : FAINT[k]);
+    const k=col[r], p=paths[r], filled=F[r];
+    c.fillStyle = filled ? pal[k] : (k===sel ? stripePattern : FAINT[k]);
     c.fill(p);
-    if(!F[r]){ c.strokeStyle=BORDER; c.lineWidth=lw; c.stroke(p); }
+    // stroking every shape (in its own colour once filled) seals the hairline anti-aliasing
+    // seam between adjoining curves; unfilled cells get the visible grey cell border instead
+    c.strokeStyle = filled ? pal[k] : BORDER; c.lineWidth=lw; c.stroke(p);
   }
   c.setTransform(dpr,0,0,dpr,0,0);
   c.textAlign='center'; c.textBaseline='middle';
@@ -701,7 +738,7 @@ $('#fit').onclick=()=>{ if(!S) return; const m=Math.min(vw,vh)*.96/S.N; animateT
 $('#reset').onclick=()=>{ if(!S) return; const now=Date.now();
   if(now-resetArm>2500){ resetArm=now; toast('한 번 더 누르면 처음부터 다시 칠해요'); return; }
   resetArm=0; store.set(saveKey(curScene,curDiff),null); start(S); toast('새로 시작해요'); };
-$('#back').onclick=()=>{ S=null; $('#play').hidden=true; $('#gallery').hidden=false; renderCards(); stopConfetti(); };
+$('#back').onclick=()=>{ clearTimeout(doneTimer); S=null; $('#play').hidden=true; $('#gallery').hidden=false; renderCards(); stopConfetti(); };
 $('#doneBack').onclick=()=>$('#back').onclick();
 $('#doneView').onclick=()=>{ $('#done').hidden=true; stopConfetti(); $('#fit').onclick(); };
 
