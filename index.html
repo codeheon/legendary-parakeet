@@ -600,7 +600,7 @@ function clampView(){ if(!S) return; const minS=Math.min(vw,vh)*.5/S.N, maxS=12;
 function req(){ if(!needDraw){ needDraw=true; requestAnimationFrame(draw); } }
 function draw(){
   needDraw=false; const c=vctx;
-  c.setTransform(1,0,0,1,0,0); c.fillStyle=getComputedStyle(stageEl).backgroundColor; c.fillRect(0,0,view.width,view.height);
+  c.setTransform(1,0,0,1,0,0); c.clearRect(0,0,view.width,view.height);
   if(!S) return;
   flush(); clampView();
   c.setTransform(dpr*s,0,0,dpr*s,dpr*tx,dpr*ty);
